@@ -1,0 +1,5 @@
+pandas>=2.0
+numpy>=1.24
+scikit-learn>=1.3
+prophet>=1.1
+kagglehub>=0.2   # only needed if pulling the real Kaggle dataset

@@ -1,0 +1,24 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+data/*.csv
+data/*.xlsx
+data/
+*.csv
+*.xlsx
+
+
+# Output files (do not push results)
+outputs/*.csv
+outputs/*.xlsx
+outputs/
+*.csv
+*.xlsx
