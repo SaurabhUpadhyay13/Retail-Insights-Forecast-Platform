@@ -229,11 +229,3 @@ daily batch refresh would plug in.
 
 ---
 
-## 6. What to say in an interview
-
-- "Built a demand-forecasting pipeline under a hard streaming constraint."
-- "Used `SGDRegressor.partial_fit` for true incremental learning and Prophet
-  for scheduled retraining on an expanding window."
-- "Combined a rolling statistical anomaly detector with Isolation Forest to
-  catch both spikes and multivariate issues."
-- "Structured the output as a Power BI star schema instead of one flat table."
