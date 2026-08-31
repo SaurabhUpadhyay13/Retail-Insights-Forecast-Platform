@@ -61,14 +61,24 @@ COLUMN_ALIASES = {
         "product_name", "product name", "prod_name", "productname",
         "product_title", "item_title", "Product",
     ],
+    "item": [
+        "item", "item_name", "item name", "article", "article_name",
+    ],
+    "brand": [
+        "brand", "brand_name", "brand name", "manufacturer", "label",
+    ],
     "cost_price": [
-        "cost_price", "cost price", "costprice", "buying_price", "MRP",
+        "cost_price", "cost price", "costprice", "buying_price",
         "buying price", "price_local", "purchase_price", "purchase price", "cp",
     ],
     "selling_price": [
-        "selling_price", "selling price", "selliing price", "price_per_unit", "price per unit", "unit_price", "unit price",
-        "selliing_price", "sale_price","sale_price_local", "sale price", "sales_price", "sp",
+        "selling_price", "selling price", "selliing price",
+        "selliing_price", "sale_price","sale_price_local", "sale price", "sales_price", "sp", "MRP",
         "sale_price_local", "saleprice", "sellingprice",
+    ],
+    "price_per_unit": [
+        "price_per_unit", "price per unit", "unit_price", "unit price",
+        "unitprice", "price_each", "each_price",
     ],
     "quantity": [
         "quantity", "qty", "units", "units_sold", "no_of_units",
@@ -77,7 +87,7 @@ COLUMN_ALIASES = {
     "total_spent": [
         "total_spent", "total spent", "total_amount", "total amount",
         "amount", "total", "sales_amount", "revenue", "grand_total",
-        "net_amount", "profit", "Total_Sales", "Total Sales",
+        "net_amount", "Total_Sales", "Total Sales",
     ],
     "payment_method": [
         "payment_method", "payment method", "payment_type",
@@ -85,6 +95,10 @@ COLUMN_ALIASES = {
     ],
     "country": ["country", "country_name", "country_code", "nation", 
                 "nation_name", "iso_country", "country_iso_code", "geo_country", "region_country"
+    ],
+    "location": [
+        "location", "store", "store_name", "store name", "retailer",
+        "branch", "branch_name", "outlet", "shop_location",
     ],
     "region": ["region", "region_name", "sales_region", "geographic_region",
                "market_region"],

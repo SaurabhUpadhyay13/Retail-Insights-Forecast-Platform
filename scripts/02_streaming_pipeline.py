@@ -17,8 +17,8 @@ TWO MODELS ARE MAINTAINED SIDE BY SIDE, on purpose, to show the trade-off:
 
   2. PERIODIC-RETRAIN MODEL (Prophet, industry-standard forecasting)
      - Prophet does not support partial_fit / online learning.
-     - So it is retrained on the expanding window of data-seen-so-far,
-       but only every REFIT_EVERY_N_DAYS (e.g. weekly), not every batch.
+     - So it is retrained periodically on a bounded rolling window, not every
+       batch. This controls runtime and adapts to recent demand drift.
      - This mirrors how most real forecasting teams actually handle
        "streaming" constraints in production: cheap online updates for
        every batch, expensive full retrains on a schedule.
@@ -32,20 +32,19 @@ ANOMALY DETECTION, similarly, uses two complementary online-friendly methods:
 ----------------------------------------------------------------------------
 """
 
-import warnings
-warnings.filterwarnings("ignore")
-
 import numpy as np
 import pandas as pd
 from pathlib import Path
+import os
 from sklearn.linear_model import SGDRegressor
-from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import IsolationForest
 import logging
 
 try:
     from prophet import Prophet
 except ImportError:  # pragma: no cover - graceful fallback if Prophet is absent
+    Prophet = None
+if os.getenv("RETAIL_DISABLE_PROPHET", "").strip().lower() in {"1", "true", "yes"}:
     Prophet = None
 
 logging.getLogger("cmdstanpy").disabled = True
@@ -65,9 +64,26 @@ OUT_ANOMALY = OUT_DIR / "anomaly_flags.csv"
 OUT_MODEL_LOG = OUT_DIR / "model_log.csv"
 
 MIN_DAYS_BEFORE_FORECASTING = 21   # need a minimum history before predicting
-REFIT_EVERY_N_DAYS = 7             # weekly Prophet / IsolationForest refit
+REFIT_EVERY_N_DAYS = int(os.getenv("RETAIL_REFIT_EVERY_N_DAYS", "28"))
+MAX_REFIT_HISTORY_DAYS = int(os.getenv("RETAIL_REFIT_HISTORY_DAYS", "365"))
 Z_SCORE_THRESHOLD = 2.5            # ~ same sensitivity as a 99% CI flag
 IF_CONTAMINATION = 0.05            # assume ~5% of days are anomalous
+
+if REFIT_EVERY_N_DAYS <= 0 or MAX_REFIT_HISTORY_DAYS < MIN_DAYS_BEFORE_FORECASTING:
+    raise ValueError(
+        "RETAIL_REFIT_EVERY_N_DAYS must be positive and "
+        "RETAIL_REFIT_HISTORY_DAYS must cover the forecast warm-up period."
+    )
+
+
+def save_csv_atomic(df: pd.DataFrame, output_path: Path) -> None:
+    """Replace a CSV only after its complete successor is safely written."""
+    temporary_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    try:
+        df.to_csv(temporary_path, index=False)
+        temporary_path.replace(output_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def load_clean_data() -> pd.DataFrame:
@@ -78,7 +94,7 @@ def load_clean_data() -> pd.DataFrame:
                 if path.suffix.lower() in {".xlsx", ".xls"}:
                     data = pd.read_excel(path)
                 else:
-                    data = pd.read_csv(path)
+                    data = pd.read_csv(path, low_memory=False)
                 print(f"Loaded cleaned data: {path} ({len(data):,} rows)")
                 return data
             except Exception as exc:
@@ -143,6 +159,16 @@ if revenue_source is None:
     df["revenue_value"] = df[price_source] * df["quantity"]
     revenue_source = "revenue_value"
 
+# A missing monetary value must not silently become zero during groupby.sum(),
+# because that manufactures valid-looking revenue and corrupts anomaly inputs.
+valid_revenue = df[revenue_source].notna() & np.isfinite(df[revenue_source])
+invalid_revenue_rows = int((~valid_revenue).sum())
+if invalid_revenue_rows:
+    print(f"WARNING: dropping {invalid_revenue_rows:,} row(s) with invalid revenue")
+    df = df.loc[valid_revenue].copy()
+if df.empty:
+    raise ValueError("No rows with valid revenue remain in the cleaned dataset.")
+
 # Isolation Forest needs a meaningful price feature. If the source has only
 # line revenue, derive its effective unit price instead of using quantity as
 # the old fallback did.
@@ -161,30 +187,46 @@ daily = (
         units_sold=("quantity", "sum"),
         revenue=(revenue_source, "sum"),
         avg_price=("unit_price_value", "mean"),
-        n_transactions=("transaction_id", "count"),
+        n_transactions=("quantity", "size"),
     )
     .reset_index()
     .rename(columns={"transaction_date": "date"})
 )
 
-# Fill in category/day combos with zero sales as explicit 0-rows
-# (a day with NO rows for a category is itself informative -> possible stockout)
-all_dates = pd.date_range(daily["date"].min(), daily["date"].max(), freq="D")
+# Fill gaps inside each category's observed active period. Extending every
+# category across the global range would invent zero demand before a product
+# line launched or after it was discontinued.
 all_categories = daily["category"].dropna().unique()
-full_index = pd.MultiIndex.from_product([all_dates, all_categories], names=["date", "category"])
-daily = (
-    daily.set_index(["date", "category"])
-    .reindex(full_index, fill_value=0)
-    .reset_index()
-)
+calendar_frames = []
+for category, category_daily in daily.groupby("category", sort=False):
+    category_daily = category_daily.set_index("date").drop(columns="category")
+    category_dates = pd.date_range(
+        category_daily.index.min(), category_daily.index.max(), freq="D"
+    )
+    category_daily = category_daily.reindex(category_dates, fill_value=0)
+    category_daily.index.name = "date"
+    category_daily["category"] = category
+    calendar_frames.append(category_daily.reset_index())
+daily = pd.concat(calendar_frames, ignore_index=True)
 if daily.empty:
     raise ValueError("Daily aggregation produced no category/date rows.")
+daily["avg_price"] = pd.to_numeric(daily["avg_price"], errors="coerce")
+derived_avg_price = np.where(
+    daily["units_sold"] > 0,
+    daily["revenue"] / daily["units_sold"],
+    0.0,
+)
+daily["avg_price"] = daily["avg_price"].fillna(
+    pd.Series(derived_avg_price, index=daily.index)
+)
+if not np.isfinite(daily[["units_sold", "revenue", "avg_price"]].to_numpy()).all():
+    raise ValueError("Daily model features contain non-finite numeric values.")
 daily["day_of_week"] = daily["date"].dt.dayofweek
 daily["is_weekend"] = (daily["day_of_week"] >= 5).astype(int)
 daily = daily.sort_values(["category", "date"]).reset_index(drop=True)
 
-print(f"Simulating streaming arrival for {daily['date'].nunique()} days "
-      f"x {len(all_categories)} categories = {len(daily)} daily batch rows")
+print(f"Simulating streaming arrival for {daily['date'].nunique()} calendar days "
+      f"across {len(all_categories)} category active periods = {len(daily)} rows")
 if Prophet is None:
     print("Prophet is not installed; Prophet forecasts will be skipped.")
 
@@ -198,8 +240,6 @@ class CategoryState:
         self.history = []              # list of dicts, the expanding window
         self.online_model = SGDRegressor(max_iter=1, learning_rate="invscaling",
                                           eta0=0.01, warm_start=True, random_state=42)
-        self.scaler = StandardScaler()
-        self.scaler_fitted = False
         self.prophet_model = None
         self.if_model = None
         self.last_refit_day = -999
@@ -222,7 +262,16 @@ class CategoryState:
         return np.sqrt(self.running_m2 / (self.running_n - 1))
 
     def make_features(self, day_index, day_of_week, is_weekend):
-        return np.array([[day_index, day_of_week, is_weekend]], dtype=float)
+        # Use a fixed transform. Incrementally changing a StandardScaler would
+        # move the coordinate system underneath coefficients learned on prior
+        # days and make the online model internally inconsistent.
+        angle = 2 * np.pi * day_of_week / 7
+        return np.array([[
+            day_index / 365.25,
+            np.sin(angle),
+            np.cos(angle),
+            is_weekend,
+        ]], dtype=float)
 
 
 states = {cat: CategoryState(cat) for cat in all_categories}
@@ -247,8 +296,7 @@ for date, day_df in daily.groupby("date"):
         online_pred, prophet_pred = np.nan, np.nan
         if d_idx >= MIN_DAYS_BEFORE_FORECASTING:
             feats = state.make_features(d_idx, row["day_of_week"], row["is_weekend"])
-            feats_scaled = state.scaler.transform(feats)
-            online_pred = max(0, state.online_model.predict(feats_scaled)[0])
+            online_pred = max(0, state.online_model.predict(feats)[0])
 
             if Prophet is not None and state.prophet_model is not None:
                 future = pd.DataFrame({"ds": [date]})
@@ -279,8 +327,9 @@ for date, day_df in daily.groupby("date"):
 
         anomaly_type = []
         if z_flag:
-            anomaly_type.append("stockout_or_spike" if z_score < 0 or z_score > 0 else "")
-            anomaly_type = ["low_demand_zscore" if z_score < 0 else "demand_spike_zscore"]
+            anomaly_type.append(
+                "low_demand_zscore" if z_score < 0 else "demand_spike_zscore"
+            )
         if if_flag:
             anomaly_type.append("multivariate_isolation_forest")
 
@@ -302,27 +351,24 @@ for date, day_df in daily.groupby("date"):
 
         # (c1) true incremental update — happens on EVERY batch
         feats = state.make_features(d_idx, row["day_of_week"], row["is_weekend"])
-        if not state.scaler_fitted:
-            state.scaler.partial_fit(feats)
-            state.scaler_fitted = True
-        else:
-            state.scaler.partial_fit(feats)
-        feats_scaled = state.scaler.transform(feats)
-        state.online_model.partial_fit(feats_scaled, [actual_units])
+        state.online_model.partial_fit(feats, [actual_units])
 
         # (c2) periodic full retrain — happens every REFIT_EVERY_N_DAYS
         did_refit = False
-        if (Prophet is not None and d_idx >= MIN_DAYS_BEFORE_FORECASTING and
+        if (d_idx >= MIN_DAYS_BEFORE_FORECASTING and
                 (d_idx - state.last_refit_day) >= REFIT_EVERY_N_DAYS):
-            hist_df = pd.DataFrame(state.history)
+            # A bounded rolling window controls training time and adapts more
+            # quickly to current demand than repeatedly fitting all history.
+            hist_df = pd.DataFrame(state.history[-MAX_REFIT_HISTORY_DAYS:])
 
-            # Prophet retrain on expanding window
-            m = Prophet(daily_seasonality=False, weekly_seasonality=True,
-                        yearly_seasonality=False, interval_width=0.9)
-            m.fit(hist_df[["ds", "y"]])
-            state.prophet_model = m
+            # Prophet retrain on the bounded recent window
+            if Prophet is not None:
+                m = Prophet(daily_seasonality=False, weekly_seasonality=True,
+                            yearly_seasonality=False, interval_width=0.9)
+                m.fit(hist_df[["ds", "y"]])
+                state.prophet_model = m
 
-            # Isolation Forest retrain on expanding window
+            # Isolation Forest retrain on the same bounded recent window
             if_train = hist_df[["y", "revenue", "avg_price", "day_of_week"]].rename(
                 columns={"y": "units_sold"})
             if len(if_train) >= 15:
@@ -344,9 +390,9 @@ forecast_df = pd.DataFrame(forecast_rows)
 anomaly_df = pd.DataFrame(anomaly_rows)
 model_log_df = pd.DataFrame(model_log_rows)
 
-forecast_df.to_csv(OUT_FORECAST, index=False)
-anomaly_df.to_csv(OUT_ANOMALY, index=False)
-model_log_df.to_csv(OUT_MODEL_LOG, index=False)
+save_csv_atomic(forecast_df, OUT_FORECAST)
+save_csv_atomic(anomaly_df, OUT_ANOMALY)
+save_csv_atomic(model_log_df, OUT_MODEL_LOG)
 
 print(f"\nDone. {forecast_df['online_model_forecast'].notna().sum()} online forecasts, "
       f"{forecast_df['prophet_forecast'].notna().sum()} Prophet forecasts produced.")

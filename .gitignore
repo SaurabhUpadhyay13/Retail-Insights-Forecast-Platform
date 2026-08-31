@@ -22,3 +22,9 @@ outputs/*.xlsx
 outputs/
 *.csv
 *.xlsx
+
+# Runtime state
+logs/
+outputs/refresh_status.json
+outputs/refresh_healthcheck.json
+outputs/.daily_refresh.lock

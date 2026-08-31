@@ -22,6 +22,16 @@ forecast_path = OUT_DIR / "daily_forecast.csv"
 anomaly_path = OUT_DIR / "anomaly_flags.csv"
 
 
+def save_csv_atomic(df: pd.DataFrame, output_path: Path) -> None:
+    """Replace a CSV only after its complete successor is safely written."""
+    temporary_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    try:
+        df.to_csv(temporary_path, index=False)
+        temporary_path.replace(output_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
 def require_file(path: Path) -> None:
     if not path.exists():
         raise FileNotFoundError(
@@ -59,8 +69,20 @@ require_columns(
 if forecast.empty or anomaly.empty:
     raise ValueError("Forecast and anomaly outputs must both contain rows.")
 for frame, source in [(forecast, forecast_path), (anomaly, anomaly_path)]:
+    if frame["date"].isna().any() or frame["category"].isna().any():
+        raise ValueError(f"{source.name} contains null date/category keys.")
     if frame.duplicated(["date", "category"]).any():
         raise ValueError(f"{source.name} contains duplicate date/category keys.")
+
+forecast_keys = pd.MultiIndex.from_frame(forecast[["date", "category"]])
+anomaly_keys = pd.MultiIndex.from_frame(anomaly[["date", "category"]])
+forecast_only = forecast_keys.difference(anomaly_keys)
+anomaly_only = anomaly_keys.difference(forecast_keys)
+if len(forecast_only) or len(anomaly_only):
+    raise ValueError(
+        "Forecast and anomaly outputs have different date/category keys "
+        f"({len(forecast_only)} forecast-only, {len(anomaly_only)} anomaly-only)."
+    )
 
 # ---------------------------------------------------------------------
 # FACT TABLE: one row per (date, category) with forecast + anomaly cols
@@ -69,16 +91,81 @@ for frame, source in [(forecast, forecast_path), (anomaly, anomaly_path)]:
 fact = forecast.merge(
     anomaly[["date", "category", "z_score", "z_score_flag",
              "isolation_forest_flag", "any_anomaly", "anomaly_type"]],
-    on=["date", "category"], how="left", validate="one_to_one"
+    on=["date", "category"], how="inner", validate="one_to_one"
+)
+fact = fact.sort_values(["category", "date"]).reset_index(drop=True)
+# A weekly seasonal baseline is both a production fallback and a necessary
+# benchmark. The current backtest shows it beating the fitted models, so it is
+# the honest champion until monitored performance says otherwise.
+fact["seasonal_naive_forecast"] = fact.groupby("category")["actual_units"].shift(7)
+fact["production_forecast"] = (
+    fact["seasonal_naive_forecast"]
+    .fillna(fact["prophet_forecast"])
+    .fillna(fact["online_model_forecast"])
+)
+fact["production_model"] = np.select(
+    [
+        fact["seasonal_naive_forecast"].notna(),
+        fact["prophet_forecast"].notna(),
+        fact["online_model_forecast"].notna(),
+    ],
+    ["seasonal_naive_7d", "prophet", "online_sgd"],
+    default="warmup_unavailable",
 )
 fact["forecast_error_online"] = (fact["actual_units"] - fact["online_model_forecast"])
 fact["forecast_error_prophet"] = (fact["actual_units"] - fact["prophet_forecast"])
+fact["forecast_error_seasonal_naive"] = (
+    fact["actual_units"] - fact["seasonal_naive_forecast"]
+)
+fact["forecast_error_production"] = (
+    fact["actual_units"] - fact["production_forecast"]
+)
 fact["forecast_error_pct_prophet"] = np.where(
     fact["actual_units"] > 0,
     (fact["forecast_error_prophet"] / fact["actual_units"]) * 100,
     np.nan
 )
-fact.to_csv(OUT_DIR / "fact_forecast_anomaly.csv", index=False)
+save_csv_atomic(fact, OUT_DIR / "fact_forecast_anomaly.csv")
+
+# ---------------------------------------------------------------------
+# MODEL SCORECARD: proves whether complex models beat a simple baseline.
+# WAPE is stable in the presence of zero-demand days where MAPE is undefined.
+# ---------------------------------------------------------------------
+model_columns = {
+    "online_sgd": "online_model_forecast",
+    "prophet": "prophet_forecast",
+    "seasonal_naive_7d": "seasonal_naive_forecast",
+    "production_selection": "production_forecast",
+}
+performance_rows = []
+for model_name, forecast_column in model_columns.items():
+    for scope, category, group in [
+        ("overall", "ALL", fact),
+        *[("category", str(name), frame) for name, frame in fact.groupby("category")],
+    ]:
+        evaluated = group.loc[
+            group[forecast_column].notna(), ["actual_units", forecast_column]
+        ]
+        if evaluated.empty:
+            continue
+        errors = evaluated["actual_units"] - evaluated[forecast_column]
+        absolute_errors = errors.abs()
+        actual_total = evaluated["actual_units"].abs().sum()
+        performance_rows.append(
+            {
+                "scope": scope,
+                "category": category,
+                "model": model_name,
+                "observations": len(evaluated),
+                "mae": round(float(absolute_errors.mean()), 4),
+                "rmse": round(float(np.sqrt(np.mean(np.square(errors)))), 4),
+                "wape_pct": round(
+                    float(absolute_errors.sum() / actual_total * 100), 4
+                ) if actual_total else np.nan,
+            }
+        )
+model_performance = pd.DataFrame(performance_rows)
+save_csv_atomic(model_performance, OUT_DIR / "model_performance.csv")
 
 # ---------------------------------------------------------------------
 # DATE DIMENSION: standard Power BI date table for slicers / time intel
@@ -90,7 +177,7 @@ date_dim["month_name"] = date_dim["date"].dt.strftime("%b")
 date_dim["week_of_year"] = date_dim["date"].dt.isocalendar().week
 date_dim["day_name"] = date_dim["date"].dt.strftime("%a")
 date_dim["is_weekend"] = date_dim["date"].dt.dayofweek >= 5
-date_dim.to_csv(OUT_DIR / "dim_date.csv", index=False)
+save_csv_atomic(date_dim, OUT_DIR / "dim_date.csv")
 
 # ---------------------------------------------------------------------
 # KPI ROLLUP: one row per category, headline numbers for card visuals
@@ -104,13 +191,17 @@ kpi = (
         anomaly_days=("any_anomaly", "sum"),
         total_days=("actual_units", "count"),
         avg_prophet_mae=("forecast_error_prophet", lambda s: s.abs().mean()),
+        avg_production_mae=("forecast_error_production", lambda s: s.abs().mean()),
     )
     .reset_index()
 )
 kpi["anomaly_rate_pct"] = (kpi["anomaly_days"] / kpi["total_days"] * 100).round(1)
-kpi.to_csv(OUT_DIR / "kpi_summary_by_category.csv", index=False)
+save_csv_atomic(kpi, OUT_DIR / "kpi_summary_by_category.csv")
 
 print("Power BI-ready files written:")
-for f in ["fact_forecast_anomaly.csv", "dim_date.csv", "kpi_summary_by_category.csv"]:
+for f in [
+    "fact_forecast_anomaly.csv", "dim_date.csv",
+    "kpi_summary_by_category.csv", "model_performance.csv",
+]:
     n = len(pd.read_csv(OUT_DIR / f))
     print(f"  {f}  ({n:,} rows)")

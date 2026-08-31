@@ -50,7 +50,7 @@ The cleaned outputs are written to:
 | `pandas` / `numpy` | data cleaning, aggregation, feature engineering |
 | `scikit-learn` - `SGDRegressor` | true online/incremental forecasting model (`partial_fit`) |
 | `scikit-learn` - `IsolationForest` | multivariate anomaly detection, refit periodically |
-| `Prophet` | forecasting model retrained on an expanding window on a schedule |
+| `Prophet` | forecasting model periodically retrained on a bounded recent window |
 | Power BI Desktop | dashboard: trend charts, anomaly table, KPI cards |
 
 ---
@@ -104,7 +104,11 @@ scripts/
   01_data_cleaning.py        # standardize, clean, impute, validate
   02_streaming_pipeline.py   # daily batch simulation + incremental models
   03_export_for_powerbi.py   # reshape into Power BI-friendly tables
-  04_daily_refresh_job.py    # example daily refresh entry point
+  04_daily_refresh_job.py    # locked, validated production batch entry point
+deploy/windows/
+  install_daily_refresh_task.ps1  # midnight Windows Task Scheduler installer
+tests/
+  test_daily_refresh_job.py
 ```
 
 ### One-command run
@@ -116,8 +120,8 @@ python main.py
 
 `main.py` runs the three production-build stages in order: clean data,
 generate forecasts/anomaly flags, then rebuild the Power BI tables. The
-`04_daily_refresh_job.py` file is a separate production handoff example and
-is not part of this historical rebuild command. The automated run writes the
+`04_daily_refresh_job.py` file is the scheduled production entry point and is
+not part of this historical rebuild command. The automated run writes the
 cleaned CSV used by forecasting and skips the redundant million-row Excel
 export. Running `01_data_cleaning.py` directly still writes both formats.
 
@@ -131,10 +135,16 @@ python scripts/02_streaming_pipeline.py
 python scripts/03_export_for_powerbi.py
 ```
 
-To inspect the separate daily-refresh handoff example, run:
+To run and validate the production refresh manually, run:
 
 ```bash
 python scripts/04_daily_refresh_job.py
+```
+
+For a fast, read-only health check of the currently published files:
+
+```bash
+python scripts/04_daily_refresh_job.py --dry-run
 ```
 
 ### Step 1 - Data cleaning (`01_data_cleaning.py`)
@@ -183,12 +193,12 @@ Two forecasting models run side by side:
 | Model | How it updates | Why |
 |---|---|---|
 | `SGDRegressor` | `.partial_fit()` on every daily batch | True incremental learning with constant memory |
-| `Prophet` | Full refit every 7 days on the expanding window | Prophet has no online-learning API |
+| `Prophet` | Refit every 28 days on the latest 365-day window | Bounded cost and adaptation to demand drift |
 
 Anomaly detection also uses two approaches:
 
 - Rolling z-score per category using Welford's algorithm
-- Isolation Forest refit every 7 days on the accumulated feature set
+- Isolation Forest refit every 28 days on the latest 365-day feature window
 
 Outputs:
 
@@ -206,12 +216,82 @@ Creates a small star schema for Power BI:
 - `outputs/fact_forecast_anomaly.csv`
 - `outputs/dim_date.csv`
 - `outputs/kpi_summary_by_category.csv`
+- `outputs/model_performance.csv`
+
+The fact table also contains a leakage-safe 7-day seasonal-naive forecast.
+The supplied backtest selects it as `production_forecast` because it currently
+beats both fitted models on WAPE. `model_performance.csv` makes that comparison
+visible instead of assuming that a more complex model must be better.
 
 ### Step 4 - Daily refresh (`04_daily_refresh_job.py`)
 
-This is a lightweight example of the job that would run once per day in
-production. It points to the exported fact table and illustrates where the
-daily batch refresh would plug in.
+This is a one-shot production batch job intended to be launched by the host
+scheduler. It provides:
+
+- an exclusive lock so two refreshes cannot overlap
+- atomic status publication to `outputs/refresh_status.json`
+- rotating logs in `logs/daily_refresh.log`
+- a 12-hour timeout per stage and one bounded retry by default
+- rollback to the last good Power BI tables when a stage or validation fails
+- post-run checks for schema, keys, negative measures, date coverage, and KPI
+  category coverage
+
+The current implementation rebuilds the complete historical model from the
+files in `data/`. This is deterministic and appropriate for the included
+portfolio-sized dataset. At warehouse scale, replace stages 1 and 2 with a
+partitioned ingestion source plus persisted model state; the scheduler and
+publication safeguards can remain unchanged.
+
+### Schedule at 12:00 AM
+
+On Windows, open PowerShell as an account allowed to register scheduled tasks
+and run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File deploy/windows/install_daily_refresh_task.ps1
+```
+
+The task uses **12:00 AM in the Windows machine's local timezone**, runs missed
+executions when the user is logged on and the machine becomes available,
+ignores overlapping starts, and retries scheduler-level failures twice. Run
+the installer from an elevated PowerShell if local policy blocks task creation.
+For Linux cron, use:
+
+```cron
+0 0 * * * cd /absolute/path/to/retail_forecast_project && .venv/bin/python scripts/04_daily_refresh_job.py
+```
+
+Power BI Service refresh is a separate deployment concern: publish the PBIX,
+configure the CSV location through OneDrive/SharePoint or an on-premises data
+gateway, and schedule the dataset refresh after this job's expected finish.
+
+### Production boundaries
+
+This repository is deployable as a single-machine scheduled batch and is ready
+for a portfolio/client demonstration. Before calling it an unattended
+enterprise deployment, complete these environment-specific items:
+
+- Replace folder-based full-history ingestion with a database/object-storage
+  incremental source and persisted per-category model state at larger volumes.
+- Run the Windows task under a managed service identity when it must execute
+  while no interactive user is logged on.
+- Configure alert delivery from `refresh_status.json`/the job exit code and
+  centralize logs in the client's monitoring platform.
+- Publish the PBIX and configure Power BI gateway/OneDrive credentials plus a
+  dataset refresh after the Python batch completes.
+- Treat backtest scores as provisional until preprocessing statistics
+  (imputation and outlier bounds) are learned inside each training window;
+  the current cleaner calculates them over each complete source file.
+- Replace or append the included sample history before a live demo when current
+  data is expected. The supplied fact data currently ends on 2025-07-22.
+
+### Verification
+
+```bash
+python -m unittest discover -s tests -v
+python -m compileall -q main.py scripts tests
+python scripts/04_daily_refresh_job.py --dry-run
+```
 
 ---
 
@@ -221,9 +301,11 @@ daily batch refresh would plug in.
 2. Import the CSV files from `outputs/`.
 3. Link `dim_date[date]` to `fact_forecast_anomaly[date]`.
 4. Build visuals:
-   - Line chart: `actual_units` and `prophet_forecast`
+   - Line chart: `actual_units` and `production_forecast`
    - Alert table: rows where `any_anomaly = TRUE`
    - KPI cards: from `kpi_summary_by_category`
+   - Model scorecard: `model`, `mae`, `rmse`, and `wape_pct` from
+     `model_performance.csv`
    - Slicers: `category`, `date`, `any_anomaly`
 5. Use conditional formatting on `z_score` to make spikes stand out.
 

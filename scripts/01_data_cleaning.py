@@ -21,7 +21,7 @@ FOLDER LAYOUT EXPECTED:
         store_a_sales.csv
         store_b_sales.csv
         store_c_sales.xlsx
-        ... any number of .csv / .xlsx / .xls files
+        ... any number of .csv / .xlsx files
 
 Requires: pandas, numpy, openpyxl (for writing .xlsx)
     pip install openpyxl
@@ -48,7 +48,7 @@ OUTPUT_XLSX = DATA_FOLDER / "retail_sales_cleaned.xlsx"
 OUTPUT_CSV = DATA_FOLDER / "retail_sales_cleaned.csv"
 AUDIT_LOG = DATA_FOLDER / "data_cleaning_audit_log.txt"
 
-SUPPORTED_EXTENSIONS = (".csv", ".xlsx", ".xls")
+SUPPORTED_EXTENSIONS = (".csv", ".xlsx")
 
 # Fields the cleaning logic below knows how to handle if present.
 # Any file missing some of these just skips that step -- nothing breaks.
@@ -75,12 +75,22 @@ OVERALL_MISSING_THRESHOLD = 0.40
 EXCEL_MAX_DATA_ROWS = 1_048_575  # Excel limit minus the header row.
 
 
+def save_csv_atomic(df: pd.DataFrame, output_path: Path) -> None:
+    """Replace a CSV only after its complete successor is safely written."""
+    temporary_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    try:
+        df.to_csv(temporary_path, index=False)
+        temporary_path.replace(output_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
 def load_raw_file(filepath: str) -> pd.DataFrame:
     """Read a single raw file (csv or excel) into a dataframe."""
     ext = os.path.splitext(filepath)[1].lower()
     if ext == ".csv":
         return pd.read_csv(filepath)
-    elif ext in (".xlsx", ".xls"):
+    elif ext == ".xlsx":
         return pd.read_excel(filepath)
     raise ValueError(f"Unsupported file type: {filepath}")
 
@@ -95,14 +105,26 @@ def to_numeric_currency(series: pd.Series) -> pd.Series:
 
 
 def normalize_discount(series: pd.Series) -> pd.Series:
-    """Convert numeric or yes/no discount values to non-negative numbers."""
+    """Convert discount values to rates in the inclusive range 0..1."""
     normalized = series.astype(str).str.strip().str.lower()
     flags = normalized.map({
-        "true": 1.0, "false": 0.0, "yes": 1.0, "no": 0.0,
-        "y": 1.0, "n": 0.0, "t": 1.0, "f": 0.0,
+        # A flag has no percentage attached. Use the project's documented
+        # default promotion rate rather than treating True as a 100% discount.
+        "true": 0.1, "false": 0.0, "yes": 0.1, "no": 0.0,
+        "y": 0.1, "n": 0.0, "t": 0.1, "f": 0.0,
     })
-    numeric = to_numeric_currency(series).abs()
-    return numeric.fillna(flags)
+    numeric = to_numeric_currency(series)
+    observed = numeric.dropna()
+    unique_values = set(observed.unique())
+    if unique_values and unique_values.issubset({0, 1}):
+        # Numeric 0/1 fields are flags, consistent with the text flag policy.
+        numeric = numeric * 0.1
+    elif not observed.empty and observed.max() > 1:
+        # Percentage-valued sources must use one scale for the whole column;
+        # otherwise values such as 0.9 and 1.1 would be interpreted as 90%
+        # and 1.1% respectively even though both mean percentage points.
+        numeric = numeric / 100
+    return numeric.fillna(flags).clip(lower=0, upper=1)
 
 
 def parse_transaction_dates(series: pd.Series) -> pd.Series:
@@ -269,14 +291,21 @@ def recompute_total_spent_from_formula(df: pd.DataFrame) -> pd.DataFrame:
 
     if "total_spent" not in df.columns:
         df["total_spent"] = np.nan
+    else:
+        # Formula results may contain cents even when the source happened to
+        # contain only whole numbers. Use a float target before assignment.
+        df["total_spent"] = pd.to_numeric(
+            df["total_spent"], errors="coerce"
+        ).astype("float64")
 
     price = pd.to_numeric(df[price_field], errors="coerce")
     quantity = pd.to_numeric(df["quantity"], errors="coerce")
 
     discount_multiplier = 1.0
     if "discount_applied" in df.columns:
-        discount = pd.to_numeric(df["discount_applied"], errors="coerce").fillna(0)
-        discount_multiplier = np.where(discount > 0, 0.9, 1.0)
+        discount = pd.to_numeric(df["discount_applied"], errors="coerce")
+        discount = discount.fillna(0).clip(lower=0, upper=1)
+        discount_multiplier = 1.0 - discount
 
     recomputed = price * quantity * discount_multiplier
     recompute_mask = price.notna() & quantity.notna() & recomputed.notna()
@@ -545,6 +574,21 @@ def clean_file(df: pd.DataFrame, source_file: str) -> pd.DataFrame:
     called its columns.
     """
     df = standardize_columns(df, verbose=False)
+    required_columns = ["category", "transaction_date", "quantity"]
+    missing_columns = [col for col in required_columns if col not in df.columns]
+    has_revenue_input = "total_spent" in df.columns or any(
+        col in df.columns for col in PRICE_COLUMNS
+    )
+    if missing_columns or not has_revenue_input:
+        detail = []
+        if missing_columns:
+            detail.append("missing " + ", ".join(missing_columns))
+        if not has_revenue_input:
+            detail.append("missing total_spent or a unit-price column")
+        raise ValueError(
+            f"{Path(source_file).name} cannot feed the forecast pipeline: "
+            + "; ".join(detail)
+        )
     n_start = len(df)
     df = drop_duplicate_transaction_ids(df, "within this file")
 
@@ -751,7 +795,7 @@ def main():
     na_counts = combined.isna().sum()
     print(f"Missing values remaining:\n{na_counts[na_counts > 0]}")
 
-    combined.to_csv(OUTPUT_CSV, index=False)
+    save_csv_atomic(combined, OUTPUT_CSV)
     if "--csv-only" in sys.argv:
         print(
             "Skipped Excel export (--csv-only); the automated forecast "
